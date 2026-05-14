@@ -42,7 +42,7 @@ sudo usermod -aG kvm $USER
 
 **1. Clone le dépôt**
 ```bash
-git clone https://github.com/TON_PSEUDO/analyse-usb.git
+git clone https://github.com/richerrail/analyse-usb.git
 cd analyse-usb
 chmod +x analyse-usb.sh
 ```

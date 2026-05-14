@@ -2,14 +2,15 @@
 # =============================================================================
 # analyse-usb.sh — Analyse de clés USB suspectes en VM isolée
 # =============================================================================
-# Auteur  : <richerrail>
+# Auteur  : <ton pseudo>
 # Licence : MIT
-# Dépôt   : https://github.com/richerrail/analyse-usb
+# Dépôt   : https://github.com/TON_PSEUDO/analyse-usb
 #
 # Description :
-#   Monte une clé USB en lecture seule, extrait son contenu, effectue une
-#   analyse statique sur l'hôte, puis lance une VM QEMU sans réseau
-#   (Alpine Linux) pour une analyse dynamique sécurisée.
+#   Monte une clé USB en lecture seule, détecte automatiquement un exécutable
+#   SFX (.exe) ou une archive (.7z), effectue une analyse statique complète
+#   sur l'hôte (file, exiftool, strings) avec log horodaté, puis lance une
+#   VM QEMU sans réseau (Alpine Linux) pour une analyse dynamique sécurisée.
 #
 # Prérequis :
 #   Arch  : sudo pacman -S qemu-full edk2-ovmf wget util-linux dosfstools \
@@ -19,20 +20,17 @@
 # =============================================================================
 set -euo pipefail
 
-# --- Configuration -----------------------------------------------------------
+
 SCRIPT_DIR="$HOME/vm-sandbox"
 ISO_URL="https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/alpine-extended-3.19.1-x86_64.iso"
 ISO_FILE="$SCRIPT_DIR/alpine-extended-3.19.1-x86_64.iso"
 SHARE_IMG="$SCRIPT_DIR/share.img"
 
-# --- Couleurs ----------------------------------------------------------------
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
-
-# --- Fonctions utilitaires ---------------------------------------------------
 
 header() {
     echo -e "${BLUE}========================================${NC}"
@@ -63,7 +61,7 @@ check_deps() {
     fi
 
     if [ ! -r /dev/kvm ]; then
-        echo -e "${YELLOW}[AVERTISSEMENT] Pas d'accès à /dev/kvm.${NC}"
+        echo -e "${YELLOW}[AVERTISSEMENT] Tu n'as pas accès à /dev/kvm.${NC}"
         echo "Ajoute-toi au groupe kvm, déconnecte-toi et reconnecte-toi :"
         echo "  sudo usermod -aG kvm \$USER"
         exit 1
@@ -80,7 +78,10 @@ find_ovmf() {
         "/usr/share/qemu/edk2-x86_64-code.fd"
     )
     for p in "${paths[@]}"; do
-        [ -f "$p" ] && echo "$p" && return 0
+        if [ -f "$p" ]; then
+            echo "$p"
+            return 0
+        fi
     done
     return 1
 }
@@ -91,18 +92,19 @@ detect_usb_disks() {
 
 check_mounted() {
     local dev="$1"
-    lsblk -rno MOUNTPOINT "/dev/$dev" 2>/dev/null | grep -v '^$' || true
+    local mnts
+    mnts=$(lsblk -rno MOUNTPOINT "/dev/$dev" 2>/dev/null | grep -v '^$' || true)
+    echo "$mnts"
 }
-
-# --- Point d'entrée ----------------------------------------------------------
 
 header
 check_deps
 
 mkdir -p "$SCRIPT_DIR"
+mkdir -p "$SCRIPT_DIR/logs"
 cd "$SCRIPT_DIR"
 
-# Téléchargement ISO Alpine
+# --- Téléchargement ISO ---
 if [ ! -f "$ISO_FILE" ]; then
     echo -e "${YELLOW}[INFO] ISO Alpine non trouvée. Téléchargement (~500 Mo)...${NC}"
     if ! wget --show-progress -q "$ISO_URL" -O "$ISO_FILE"; then
@@ -114,14 +116,14 @@ else
     echo -e "${GREEN}[OK] ISO déjà présente.${NC}"
 fi
 
-# Firmware UEFI
+# --- Recherche firmware UEFI ---
 OVMF=$(find_ovmf) || {
     echo -e "${RED}[ERREUR] Fichier UEFI (OVMF) introuvable.${NC}"
     echo "Installe : sudo pacman -S edk2-ovmf"
     exit 1
 }
 
-# Détection des clés USB
+# --- Détection clés USB ---
 echo ""
 echo -e "${YELLOW}[INFO] Recherche des disques USB...${NC}"
 echo ""
@@ -130,7 +132,7 @@ USB_DISKS=$(detect_usb_disks)
 
 if [ -z "$USB_DISKS" ]; then
     echo -e "${RED}[ERREUR] Aucun disque USB détecté.${NC}"
-    echo "Branche ta clé USB et attends 2-3 secondes, puis relance le script."
+    echo "Branche ta clé USB et attends 2-3 secondes, puis relance ce script."
     exit 1
 fi
 
@@ -151,21 +153,20 @@ if [ ! -b "/dev/$DEVNAME" ]; then
     exit 1
 fi
 
-# Protection contre la sélection du disque système
+# Sécurité
 ROOT_DEV=$(findmnt -n -o SOURCE / 2>/dev/null | sed 's/\[.*\]//' || true)
 if [ -n "$ROOT_DEV" ] && echo "$ROOT_DEV" | grep -q "^/dev/$DEVNAME"; then
     echo -e "${RED}[ERREUR CRITIQUE] /dev/$DEVNAME est ton disque système !${NC}"
     exit 1
 fi
 
-# Démontage si nécessaire
+# --- Monter la clé sur l'hôte en lecture seule ---
 MOUNTS=$(check_mounted "$DEVNAME")
 if [ -n "$MOUNTS" ]; then
     echo -e "${YELLOW}[INFO] Démontage de la clé sur l'hôte...${NC}"
     sudo umount "/dev/${DEVNAME}"* 2>/dev/null || true
 fi
 
-# Montage en lecture seule
 MOUNT_PT=$(mktemp -d)
 echo -e "${YELLOW}[INFO] Montage de /dev/${DEVNAME}1 en lecture seule...${NC}"
 if ! sudo mount -o ro "/dev/${DEVNAME}1" "$MOUNT_PT" 2>/dev/null; then
@@ -176,95 +177,141 @@ if ! sudo mount -o ro "/dev/${DEVNAME}1" "$MOUNT_PT" 2>/dev/null; then
     fi
 fi
 
-# Recherche de l'archive .7z
+# --- Chercher les fichiers suspects ---
+# Cherche .exe (SFX 7z) ou .7z
+EXE_FILE=$(find "$MOUNT_PT" -maxdepth 3 -type f -iname "*.exe" | head -n 1)
 ARCHIVE=$(find "$MOUNT_PT" -maxdepth 3 -type f -iname "*.7z" | head -n 1)
-if [ -z "$ARCHIVE" ]; then
-    echo -e "${RED}[ERREUR] Aucune archive .7z trouvée sur la clé.${NC}"
+
+TARGET_FILE=""
+IS_SFX=false
+
+if [ -n "$EXE_FILE" ]; then
+    TARGET_FILE="$EXE_FILE"
+    echo -e "${GREEN}[OK] Exécutable trouvé : $(basename "$EXE_FILE")${NC}"
+    IS_SFX=true
+elif [ -n "$ARCHIVE" ]; then
+    TARGET_FILE="$ARCHIVE"
+    echo -e "${GREEN}[OK] Archive trouvée : $(basename "$ARCHIVE")${NC}"
+else
+    echo -e "${RED}[ERREUR] Aucun .exe ni .7z trouvé sur la clé.${NC}"
     sudo umount "$MOUNT_PT"
     rmdir "$MOUNT_PT"
     exit 1
 fi
 
-echo -e "${GREEN}[OK] Archive trouvée : $(basename "$ARCHIVE")${NC}"
-
-# Installation des outils si absents
-for pkg_cmd in "7z:p7zip" "exiftool:perl-image-exiftool"; do
-    cmd="${pkg_cmd%%:*}"
-    pkg="${pkg_cmd##*:}"
-    if ! command -v "$cmd" &> /dev/null; then
-        echo -e "${YELLOW}[INFO] Installation de $pkg...${NC}"
-        sudo pacman -S --noconfirm "$pkg" 2>/dev/null || sudo pacman -S "$pkg"
-    fi
-done
-
-# Extraction
-EXTRACT_DIR=$(mktemp -d)
-echo -e "${YELLOW}[INFO] Extraction de l'archive...${NC}"
-7z x -o"$EXTRACT_DIR" "$ARCHIVE"
-
-# Analyse statique rapide
-EXE_FILE=$(find "$EXTRACT_DIR" -maxdepth 2 -type f -iname "*.exe" | head -n 1)
-if [ -n "$EXE_FILE" ]; then
-    echo ""
-    echo -e "${GREEN}=== ANALYSE STATIQUE SUR L'HOTE ===${NC}"
-    echo ""
-    echo -e "${YELLOW}Fichier :${NC} $(basename "$EXE_FILE")"
-    echo ""
-    echo -e "${YELLOW}[file]${NC}"
-    file "$EXE_FILE"
-    echo ""
-    echo -e "${YELLOW}[exiftool]${NC}"
-    exiftool "$EXE_FILE" 2>/dev/null | head -n 20
-    echo ""
-    echo -e "${YELLOW}[strings — éléments suspects]${NC}"
-    strings "$EXE_FILE" \
-        | grep -iE "(http|https|ftp|cmd|powershell|netsh|regsvr32|rundll32|WScript|eval|base64)" \
-        | head -n 15
-    echo ""
+# --- Installer les outils sur l'hôte si besoin ---
+if ! command -v 7z &> /dev/null; then
+    echo -e "${YELLOW}[INFO] Installation de p7zip sur l'hôte...${NC}"
+    sudo pacman -S --noconfirm p7zip 2>/dev/null || sudo pacman -S p7zip
+fi
+if ! command -v exiftool &> /dev/null; then
+    echo -e "${YELLOW}[INFO] Installation de exiftool sur l'hôte...${NC}"
+    sudo pacman -S --noconfirm perl-image-exiftool 2>/dev/null || sudo pacman -S perl-image-exiftool
 fi
 
-# Création du disque virtuel partagé
-echo -e "${YELLOW}[INFO] Création du disque virtuel pour la VM...${NC}"
+# --- Analyse statique rapide sur l'hôte ---
+LOG_FILE="$SCRIPT_DIR/logs/analyse-$(basename "$TARGET_FILE")-$(date +%Y%m%d-%H%M%S).log"
+
+echo ""
+echo -e "${GREEN}=== ANALYSE STATIQUE RAPIDE SUR L'HOTE ===${NC}"
+echo ""
+echo -e "${YELLOW}Fichier analysé :${NC} $(basename "$TARGET_FILE")"
+echo -e "${YELLOW}Log sauvegardé dans :${NC} $LOG_FILE"
+echo ""
+
+{
+    echo "========================================"
+    echo "ANALYSE STATIQUE - $(date)"
+    echo "Fichier: $TARGET_FILE"
+    echo "========================================"
+    echo ""
+
+    echo "--- [file] ---"
+    file "$TARGET_FILE"
+    echo ""
+
+    if [ "$IS_SFX" = true ]; then
+        echo "--- [7z l] Contenu de l'archive SFX ---"
+        7z l "$TARGET_FILE"
+        echo ""
+    fi
+
+    echo "--- [exiftool] ---"
+    exiftool "$TARGET_FILE" 2>/dev/null
+    echo ""
+
+    echo "--- [strings - URLs/commandes/IP suspectes] ---"
+    strings "$TARGET_FILE" | grep -iE "(http|https|ftp|cmd|powershell|netsh|regsvr32|rundll32|WScript|eval|base64|127\.|192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.)" | sort -u
+    echo ""
+
+    echo "--- [strings COMPLET] ---"
+    strings "$TARGET_FILE"
+    echo ""
+
+    echo "========================================"
+    echo "FIN DE L'ANALYSE"
+    echo "========================================"
+} | tee "$LOG_FILE"
+
+echo ""
+echo -e "${GREEN}[OK] Log complet sauvegardé dans :${NC} $LOG_FILE"
+echo ""
+
+# --- Extraire le contenu ---
+EXTRACT_DIR=$(mktemp -d)
+echo -e "${YELLOW}[INFO] Extraction du contenu...${NC}"
+if [ "$IS_SFX" = true ]; then
+    7z x -o"$EXTRACT_DIR" "$TARGET_FILE"
+else
+    7z x -o"$EXTRACT_DIR" "$TARGET_FILE"
+fi
+
+# --- Créer un disque virtuel avec le contenu extrait + l'exe ---
+echo -e "${YELLOW}[INFO] Création d'un disque virtuel pour la VM...${NC}"
 rm -f "$SHARE_IMG"
-dd if=/dev/zero of="$SHARE_IMG" bs=1M count=200 status=none
+dd if=/dev/zero of="$SHARE_IMG" bs=1M count=500 status=none
 mkfs.vfat -n SHARE "$SHARE_IMG" > /dev/null
 
 MOUNT_SHARE=$(mktemp -d)
 sudo mount -o loop "$SHARE_IMG" "$MOUNT_SHARE"
-sudo cp -r "$EXTRACT_DIR"/* "$MOUNT_SHARE/"
+sudo cp "$TARGET_FILE" "$MOUNT_SHARE/"
+if [ -n "$(ls -A "$EXTRACT_DIR")" ]; then
+    sudo cp -r "$EXTRACT_DIR"/* "$MOUNT_SHARE/"
+fi
 sudo umount "$MOUNT_SHARE"
 rmdir "$MOUNT_SHARE"
 
-# Nettoyage
+# Nettoyer
 sudo umount "$MOUNT_PT"
 rmdir "$MOUNT_PT"
 rm -rf "$EXTRACT_DIR"
 
 echo -e "${GREEN}[OK] Disque virtuel prêt.${NC}"
 
-# Lancement QEMU
+# --- Lancement QEMU ---
 echo ""
 echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN}  LANCEMENT DE LA VM ISOLEE             ${NC}"
+echo -e "${GREEN}  LANCEMENT DE LA VM ISOLEE            ${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo ""
-echo "  → Réseau    : DÉSACTIVÉ (-net none)"
-echo "  → Clé USB   : isolée sur l'hôte"
-echo "  → Fichiers  : montables via /dev/vda dans la VM"
+echo "  → Réseau : DESACTIVE (-net none)"
+echo "  → Clé USB : isolée sur l'hôte"
+echo "  → Fichiers : disponibles sur un disque virtuel dans la VM"
 echo ""
-echo -e "${YELLOW}Commandes utiles dans la VM (login: root) :${NC}"
+echo -e "${YELLOW}DANS LA VM :${NC}"
 echo ""
 echo "  mkdir -p /mnt/share && mount /dev/vda /mnt/share"
-echo "  cd /mnt/share && ls -la"
+echo "  cd /mnt/share"
+echo "  ls -la"
 echo ""
-echo "  file *.exe"
-echo "  strings *.exe | less"
-echo "  exiftool *.exe"
+echo "  # Voir le contenu extrait :"
+echo "  ls -la"
 echo ""
-echo "  # Exécution optionnelle avec Wine :"
-echo "  apk add wine && wine *.exe"
+echo "  # Pour exécuter avec Wine (si tu veux voir) :"
+echo "  apk add wine"
+echo "  wine *.exe"
 echo ""
-echo -e "${BLUE}Pour arrêter : ferme la fenêtre QEMU ou Ctrl+Alt+2 → quit${NC}"
+echo -e "${BLUE}Pour arrêter : ferme la fenêtre QEMU ou Ctrl+Alt+2 puis 'quit'${NC}"
 echo ""
 
 sleep 2

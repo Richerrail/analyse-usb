@@ -5,7 +5,7 @@
 [![Requires: QEMU](https://img.shields.io/badge/requires-QEMU-orange.svg)]()
 [![Shell: Bash](https://img.shields.io/badge/shell-bash-green.svg)]()
 
-Script Bash qui analyse le contenu d'une clé USB suspecte dans une machine virtuelle **totalement isolée du réseau**, sans risque pour l'hôte.
+Script Bash qui analyse le contenu d'une clé USB suspecte dans une machine virtuelle **totalement isolée du réseau**, sans risque pour l'hôte. Supporte les archives `.7z` et les exécutables auto-extractibles `.exe` (SFX).
 
 ---
 
@@ -42,7 +42,7 @@ sudo usermod -aG kvm $USER
 
 **1. Clone le dépôt**
 ```bash
-git clone https://github.com/richerrail/analyse-usb.git
+git clone https://github.com/TON_PSEUDO/analyse-usb.git
 cd analyse-usb
 chmod +x analyse-usb.sh
 ```
@@ -68,16 +68,19 @@ Détection des disques USB (lsblk)
 Montage en lecture seule sur l'hôte
       │
       ▼
-Extraction de l'archive .7z
+Détection automatique du fichier cible
+      ├─ .exe trouvé  →  traité comme archive SFX (7z l pour lister le contenu)
+      └─ .7z trouvé  →  archive standard
       │
-      ├─► Analyse statique sur l'hôte
+      ├─► Analyse statique sur l'hôte  →  log horodaté dans logs/
       │     • file       → type de fichier
-      │     • exiftool   → métadonnées
-      │     • strings    → URLs / commandes suspectes
+      │     • 7z l       → contenu de l'archive SFX (si .exe)
+      │     • exiftool   → métadonnées complètes
+      │     • strings    → URLs, IP, commandes suspectes (filtré + complet)
       │
       ▼
-Création d'un disque virtuel FAT (share.img)
-      │
+Création d'un disque virtuel FAT 500 Mo (share.img)
+      │   (fichier original + contenu extrait)
       ▼
 Lancement QEMU (Alpine Linux, -net none)
       │
@@ -120,6 +123,7 @@ wine *.exe
 | Lecture seule | La clé USB est montée en `ro` sur l'hôte |
 | Pas de disque persistant | Tout disparaît à l'arrêt de la VM |
 | Protection disque système | Vérifie que le device choisi n'est pas `/` |
+| Log horodaté | Chaque analyse est tracée dans `logs/` sur l'hôte |
 
 ---
 
@@ -128,6 +132,7 @@ wine *.exe
 ```
 analyse-usb/
 ├── analyse-usb.sh   # Script principal
+├── LICENSE          # Licence MIT
 └── README.md        # Ce fichier
 ```
 
